@@ -71,7 +71,10 @@ async fn metrics_handler(
         }
     };
 
-    let metrics_str = sessions.build_metrics_string(&config.metrics_prefix);
+    let metrics_str = sessions.build_metrics_string(
+        &config.metrics_prefix,
+        config.allow_duplicated_user_sessions,
+    );
 
     {
         let mut cache_guard = cache.lock().unwrap();
@@ -99,6 +102,12 @@ async fn metrics_handler(
 /// Returns true if the allowed_ips list is empty or contains the given IP address.
 fn is_allowed(ip: &IpAddr, allowed_ips: &Option<String>) -> bool {
     if let Some(allowed_list) = allowed_ips {
+        // If the list is empty, all IPs are allowed, this is in case someone
+        // sets an empty string as the allowed_ips value.
+        if allowed_list.trim().is_empty() {
+            return true;
+        }
+
         let allowed: Vec<&str> = allowed_list
             .split(',')
             .map(|s| s.trim())

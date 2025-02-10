@@ -26,7 +26,7 @@ pub struct Config {
     pub metrics_endpoint: String,
 
     /// Metrics prefix
-    #[arg(long, default_value = "login.counter")]
+    #[arg(long, default_value = "login_counter")]
     pub metrics_prefix: String,
 
     /// Scrape interval in milliseconds (ie, cache duration)
@@ -36,6 +36,10 @@ pub struct Config {
     /// Optional comma-separated list of allowed IP or CIDR addresses (if not provided, all IPs are allowed)
     #[arg(long, value_parser = validate_allowed_ips)]
     pub allowed_ips: Option<String>,
+
+    /// Don't deduplicate user sessions per type, instead counting every session
+    #[arg(long, action)]
+    pub allow_duplicated_user_sessions: bool,
 }
 
 #[actix_web::main]
