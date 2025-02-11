@@ -63,7 +63,7 @@ async fn metrics_handler(
         }
     }
 
-    let sessions = match metrics::run_loginctl() {
+    let sessions = match metrics::scrape_sessions() {
         Ok(s) => s,
         Err(err_msg) => {
             warn!("Error getting metrics: {}", err_msg);
