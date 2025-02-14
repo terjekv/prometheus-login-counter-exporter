@@ -40,6 +40,10 @@ pub struct Config {
     /// Don't deduplicate user sessions per type, instead counting every session
     #[arg(long, action)]
     pub allow_duplicated_user_sessions: bool,
+
+    /// Ignore users by name (comma separated)
+    #[arg(long, default_value = "root,gdm")]
+    pub ignore_users: Option<String>,
 }
 
 #[actix_web::main]

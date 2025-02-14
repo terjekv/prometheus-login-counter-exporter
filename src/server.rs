@@ -63,7 +63,13 @@ async fn metrics_handler(
         }
     }
 
-    let sessions = match metrics::scrape_sessions() {
+    let users_to_ignore = config
+        .ignore_users
+        .as_ref()
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|| Vec::new());
+
+    let sessions = match metrics::scrape_sessions(users_to_ignore) {
         Ok(s) => s,
         Err(err_msg) => {
             warn!("Error getting metrics: {}", err_msg);

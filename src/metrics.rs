@@ -27,7 +27,7 @@ pub struct LoginctlSession {
 }
 
 trait Scrape {
-    fn scrape_sessions() -> Result<UnifiedSessions, String>;
+    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String>;
 }
 
 impl From<LoginctlSession> for UnifiedSession {
@@ -68,7 +68,7 @@ impl From<WhoSession> for UnifiedSession {
 
 impl Scrape for LoginctlSession {
     /// Runs loginctl and converts its JSON output into unified sessions.
-    fn scrape_sessions() -> Result<UnifiedSessions, String> {
+    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
         let output = Command::new("loginctl")
             .args(&[
                 "list-sessions",
@@ -89,8 +89,10 @@ impl Scrape for LoginctlSession {
         let sessions: Vec<LoginctlSession> = serde_json::from_str(&stdout)
             .map_err(|e| format!("Failed to parse JSON from loginctl: {}", e))?;
         // Convert each LoginctlSession into a UnifiedSession.
+
         Ok(sessions
             .into_iter()
+            .filter(|s| !users_to_ignore.contains(&s.user))
             .map(Into::into)
             .collect::<Vec<_>>()
             .into())
@@ -99,7 +101,7 @@ impl Scrape for LoginctlSession {
 
 impl Scrape for WhoSession {
     /// Runs `who` and converts its output into unified sessions.
-    fn scrape_sessions() -> Result<UnifiedSessions, String> {
+    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
         let output = Command::new("who")
             .output()
             .map_err(|e| format!("Error executing who: {}", e))?;
@@ -111,6 +113,7 @@ impl Scrape for WhoSession {
         let sessions: Vec<_> = stdout
             .lines()
             .filter_map(|line| parse_who_line(line))
+            .filter(|s| !users_to_ignore.contains(&s.user))
             .map(Into::into)
             .collect();
         Ok(sessions.into())
@@ -241,14 +244,14 @@ impl UnifiedSessions {
 //
 // Public scraper function that dispatches to the correct platform implementation.
 //
-pub fn scrape_sessions() -> Result<UnifiedSessions, String> {
+pub fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
     #[cfg(target_os = "linux")]
     {
-        LoginctlSession::scrape_sessions()
+        LoginctlSession::scrape_sessions(users_to_ignore)
     }
     #[cfg(target_os = "macos")]
     {
-        WhoSession::scrape_sessions()
+        WhoSession::scrape_sessions(users_to_ignore)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
