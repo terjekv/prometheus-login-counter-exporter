@@ -6,7 +6,7 @@ use ipnetwork::IpNetwork;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 pub async fn run(config: Arc<Config>, cache: Cache) -> std::io::Result<()> {
     let host = config.listen_host.clone();
@@ -108,9 +108,11 @@ async fn metrics_handler(
 /// Returns true if the allowed_ips list is empty or contains the given IP address.
 fn is_allowed(ip: &IpAddr, allowed_ips: &Option<String>) -> bool {
     if let Some(allowed_list) = allowed_ips {
+        trace!("Allowed list, input: {}", allowed_list);
         // If the list is empty, all IPs are allowed, this is in case someone
         // sets an empty string as the allowed_ips value.
         if allowed_list.trim().is_empty() {
+            trace!("Allowed list is empty");
             return true;
         }
 
@@ -119,6 +121,9 @@ fn is_allowed(ip: &IpAddr, allowed_ips: &Option<String>) -> bool {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
+
+        trace!("Allowed list, processed: {:?}", allowed);
+
         allowed.iter().any(|&entry| {
             if let Ok(net) = entry.parse::<IpNetwork>() {
                 net.contains(*ip)
