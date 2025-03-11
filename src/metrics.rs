@@ -11,6 +11,12 @@ use std::process::Command;
 pub enum SessionSource {
     Loginctl(LoginctlSession),
     Who(WhoSession),
+    Windows(WindowsSession),
+}
+
+
+trait Scrape {
+    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String>;
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -24,10 +30,6 @@ pub struct LoginctlSession {
     pub state: String,
     pub idle: bool,
     pub since: Option<u64>,
-}
-
-trait Scrape {
-    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String>;
 }
 
 impl From<LoginctlSession> for UnifiedSession {
@@ -62,6 +64,24 @@ impl From<WhoSession> for UnifiedSession {
             terminal: ws.terminal.clone(),
             host: ws.host.clone(),
             source: SessionSource::Who(ws),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowsSession {
+    pub user: String,
+    pub terminal: String,
+    pub host: Option<String>, // If set, indicates a remote session (e.g. from RDP)
+}
+
+impl From<WindowsSession> for UnifiedSession {
+    fn from(ws: WindowsSession) -> Self {
+        UnifiedSession {
+            user: ws.user.clone(),
+            terminal: ws.terminal.clone(),
+            host: ws.host.clone(),
+            source: SessionSource::Windows(ws),
         }
     }
 }
@@ -118,6 +138,78 @@ impl Scrape for WhoSession {
             .collect();
         Ok(sessions.into())
     }
+}
+
+/// Runs `query user` on Windows, applies a heuristic to detect remote sessions,
+/// and converts the output into unified sessions.
+impl Scrape for WindowsSession {
+    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
+        let output = Command::new("query")
+            .args(&["user"])
+            .output()
+            .map_err(|e| format!("Error executing query user: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("query user returned error: {}", stderr));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut sessions = Vec::new();
+        let mut lines = stdout.lines();
+
+        // Skip the header line (e.g., "USERNAME  SESSIONNAME  ID  STATE  IDLE TIME  LOGON TIME")
+        lines.next();
+
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Split the line by whitespace.
+            // Expected columns: USERNAME, SESSIONNAME, ID, STATE, IDLE TIME, LOGON TIME.
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let session = parse_query_user_line(line);
+            if let Some(session) = session {
+                if !users_to_ignore.contains(&session.user) {
+                    sessions.push(session);
+                }
+            }
+        }
+
+        Ok(sessions
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .into())
+    }
+}
+
+fn parse_query_user_line(line: &str) -> Option<WindowsSession> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let user = parts[0].to_string();
+    let terminal = parts[1].to_string();
+    let active = parts[3].to_lowercase();
+    if active != "active" {
+        return None;
+    }
+    // If the terminal contains a '#' character, we consider it a remote session. These are usually
+    // RDP sessions, where the terminal is in the form "rdp-tcp#5" or vmware-rds#0.
+    let host = if terminal.contains("#") {
+        Some("remote".to_string())
+    } else {
+        None
+    };
+    Some(WindowsSession {
+        user,
+        terminal,
+        host,
+    })
 }
 
 /// Parses one line from `who` output.
@@ -256,5 +348,132 @@ pub fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err("Unsupported platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yare::parameterized;
+    use serde_json;
+
+    // --- Test for parsing a single line of `who` output ---
+    #[parameterized(
+        alice_session = { "alice    console    Feb  5 09:03", "alice", "console", None::<&str> },
+        alice_remote  = { "alice    tty1       Feb 10 09:51 (test.host.com)", "alice", "tty1", Some("test.host.com") },
+        bob_session   = { "bob      tty7       Feb 10 09:51 (192.168.1.100)", "bob", "tty7", Some("192.168.1.100") }
+    )]
+    fn test_parse_who_line(
+        line: &str,
+        expected_user: &str,
+        expected_terminal: &str,
+        expected_host: Option<&str>,
+    ) {
+        let session = parse_who_line(line).expect("Line should be parsed into WhoSession");
+        assert_eq!(session.user, expected_user);
+        assert_eq!(session.terminal, expected_terminal);
+        match (session.host, expected_host) {
+            (Some(host), Some(exp)) => assert_eq!(host, exp),
+            (None, None) => {},
+            (a, b) => panic!("Mismatched host: got {:?}, expected {:?}", a, b),
+        }
+    }
+
+    // --- Test for converting Loginctl JSON output to UnifiedSession ---
+    #[parameterized(
+        session_remote = { 
+            r#"[{"session": "1", "uid": 1000, "user": "alice", "seat": "", "tty": "tty1", "state": "active", "idle": false, "since": null}]"#, 
+            "alice", 
+            Some("remote")
+        },
+        session_local = { 
+            r#"[{"session": "2", "uid": 1001, "user": "bob", "seat": "seat0", "tty": "tty2", "state": "active", "idle": false, "since": null}]"#, 
+            "bob", 
+            None::<&str>
+        }
+    )]
+    fn test_loginctl_to_unified(json_input: &str, expected_user: &str, expected_host: Option<&str>) {
+        let sessions: Vec<LoginctlSession> = serde_json::from_str(json_input)
+            .expect("JSON should parse into LoginctlSession vector");
+        let unified: Vec<UnifiedSession> = sessions.into_iter().map(Into::into).collect();
+        assert_eq!(unified.len(), 1);
+        let session = &unified[0];
+        assert_eq!(session.user, expected_user);
+        match (&session.host, expected_host) {
+            (Some(h), Some(exp)) => assert_eq!(h, exp),
+            (None, None) => {},
+            (a, b) => panic!("Mismatched host: got {:?}, expected {:?}", a, b),
+        }
+    }
+
+    // --- Test for WindowsSession parsing using the heuristic for remote sessions ---
+    #[parameterized(
+        remote_session = { "john rdp-tcp#5 2 Active 2:15 9/14/2021 8:00AM", "john", "rdp-tcp#5", Some("remote") },
+        remote_vmware_session = { "jane vmware-rds#0 3 Active 0 9/14/2021 7:50AM", "jane", "vmware-rds#0", Some("remote") },
+        local_session  = { "jane console 3 Active 0 9/14/2021 7:50AM", "jane", "console", None::<&str> }
+    )]
+    fn test_windows_session_parsing(
+        line: &str,
+        expected_user: &str,
+        expected_terminal: &str,
+        expected_host: Option<&str>,
+    ) {
+        let session = parse_query_user_line(line).expect("Line should be parsed into WindowsSession");
+        assert_eq!(session.user, expected_user);
+        assert_eq!(session.terminal, expected_terminal);
+        match (&session.host, expected_host) {
+            (Some(h), Some(exp)) => assert_eq!(h, &exp.to_string()),
+            (None, None) => {},
+            (a, b) => panic!("Mismatched host: got {:?}, expected {:?}", a, b),
+        }
+    }
+
+    // --- Test the aggregation logic in UnifiedSessions ---
+    #[test]
+    fn test_aggregate_unified_sessions() {
+        let sessions = vec![
+            UnifiedSession {
+                user: "alice".to_string(),
+                terminal: "console".to_string(),
+                host: None,
+                source: SessionSource::Who(WhoSession {
+                    user: "alice".to_string(),
+                    terminal: "console".to_string(),
+                    host: None,
+                }),
+            },
+            UnifiedSession {
+                user: "bob".to_string(),
+                terminal: "rdp-tcp#1".to_string(),
+                host: Some("remote".to_string()),
+                source: SessionSource::Windows(WindowsSession {
+                    user: "bob".to_string(),
+                    terminal: "rdp-tcp#1".to_string(),
+                    host: Some("remote".to_string()),
+                }),
+            },
+            // Duplicate user (alice appears twice but with different terminals)
+            UnifiedSession {
+                user: "alice".to_string(),
+                terminal: "console2".to_string(),
+                host: None,
+                source: SessionSource::Who(WhoSession {
+                    user: "alice".to_string(),
+                    terminal: "console2".to_string(),
+                    host: None,
+                }),
+            },
+        ];
+        let unified_sessions = UnifiedSessions { sessions };
+
+        // Raw count: local should count 2 sessions (alice appears twice), remote 1 session.
+        let (local_raw, remote_raw) = unified_sessions.count_sessions();
+        assert_eq!(local_raw, 2);
+        assert_eq!(remote_raw, 1);
+
+        // Unique user count: local should count 1 unique user (alice), remote 1 unique user (bob).
+        let (local_unique, remote_unique) = unified_sessions.count_unique_users();
+        assert_eq!(local_unique, 1);
+        assert_eq!(remote_unique, 1);
     }
 }
