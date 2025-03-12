@@ -1,4 +1,4 @@
-// metrics.rs
+use crate::types::UserFilter;
 
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -16,7 +16,7 @@ pub enum SessionSource {
 
 
 trait Scrape {
-    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String>;
+    fn scrape_sessions(user_filter: &UserFilter) -> Result<UnifiedSessions, String>;
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -88,7 +88,7 @@ impl From<WindowsSession> for UnifiedSession {
 
 impl Scrape for LoginctlSession {
     /// Runs loginctl and converts its JSON output into unified sessions.
-    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
+    fn scrape_sessions(user_filter: &UserFilter) -> Result<UnifiedSessions, String> {
         let output = Command::new("loginctl")
             .args(&[
                 "list-sessions",
@@ -112,7 +112,7 @@ impl Scrape for LoginctlSession {
 
         Ok(sessions
             .into_iter()
-            .filter(|s| !users_to_ignore.contains(&s.user))
+            .filter(|s| user_filter.keep(&s.user))
             .map(Into::into)
             .collect::<Vec<_>>()
             .into())
@@ -121,7 +121,7 @@ impl Scrape for LoginctlSession {
 
 impl Scrape for WhoSession {
     /// Runs `who` and converts its output into unified sessions.
-    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
+    fn scrape_sessions(user_filter: &UserFilter) -> Result<UnifiedSessions, String> {
         let output = Command::new("who")
             .output()
             .map_err(|e| format!("Error executing who: {}", e))?;
@@ -133,7 +133,7 @@ impl Scrape for WhoSession {
         let sessions: Vec<_> = stdout
             .lines()
             .filter_map(|line| parse_who_line(line))
-            .filter(|s| !users_to_ignore.contains(&s.user))
+            .filter(|s| user_filter.keep(&s.user))
             .map(Into::into)
             .collect();
         Ok(sessions.into())
@@ -143,7 +143,7 @@ impl Scrape for WhoSession {
 /// Runs `query user` on Windows, applies a heuristic to detect remote sessions,
 /// and converts the output into unified sessions.
 impl Scrape for WindowsSession {
-    fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
+    fn scrape_sessions(user_filter: &UserFilter) -> Result<UnifiedSessions, String> {
         let output = Command::new("query")
             .args(&["user"])
             .output()
@@ -173,9 +173,9 @@ impl Scrape for WindowsSession {
             }
             let session = parse_query_user_line(line);
             if let Some(session) = session {
-                if !users_to_ignore.contains(&session.user) {
+                if user_filter.keep(&session.user) {
                     sessions.push(session);
-                }
+                } 
             }
         }
 
@@ -333,17 +333,22 @@ impl UnifiedSessions {
     }
 }
 
+
 //
 // Public scraper function that dispatches to the correct platform implementation.
 //
-pub fn scrape_sessions(users_to_ignore: Vec<String>) -> Result<UnifiedSessions, String> {
+pub fn scrape_sessions(user_filter: &UserFilter) -> Result<UnifiedSessions, String> {
     #[cfg(target_os = "linux")]
     {
-        LoginctlSession::scrape_sessions(users_to_ignore)
+        LoginctlSession::scrape_sessions(&user_filter)
     }
     #[cfg(target_os = "macos")]
     {
-        WhoSession::scrape_sessions(users_to_ignore)
+        WhoSession::scrape_sessions(&user_filter)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        WindowsSession::scrape_sessions(&user_filter)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

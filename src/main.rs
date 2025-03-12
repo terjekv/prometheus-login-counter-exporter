@@ -1,11 +1,13 @@
 mod cache;
 mod metrics;
 mod server;
+mod types;
 
 use ipnetwork::IpNetwork;
 use std::net::IpAddr;
 
 use clap::Parser;
+use regex;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -38,12 +40,17 @@ pub struct Config {
     pub allowed_ips: Option<String>,
 
     /// Don't deduplicate user sessions per type, instead counting every session
-    #[arg(long, action)]
+    #[arg(long, action, default_value = "false")]
     pub allow_duplicated_user_sessions: bool,
 
     /// Ignore users by name (comma separated)
     #[arg(long, default_value = "root,gdm")]
     pub ignore_users: Option<String>,
+
+    /// Ignore users by regex, can be specified multiple times
+    /// Example: --ignore-users-regex '^(root|gdm)$' --ignore-users-regex '-adm$'
+    #[arg(long, value_parser = validate_regex)]
+    pub ignore_users_regex: Option<Vec<String>>,
 }
 
 #[actix_web::main]
@@ -83,4 +90,13 @@ fn validate_allowed_ips(s: &str) -> Result<String, String> {
         }
     }
     Ok(s.to_string())
+}
+
+/// Validate that the provided regular expression is valid.
+/// If the regular expression is valid, the function returns Ok(String) with the original string;
+/// otherwise, it returns an error.
+fn validate_regex(s: &str) -> Result<String, String> {
+    regex::Regex::new(s)
+        .map(|_| s.to_string())
+        .map_err(|e| format!("Invalid regular expression '{}': {}", s, e))
 }

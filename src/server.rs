@@ -1,5 +1,6 @@
 use crate::cache::{Cache, CachedMetrics};
 use crate::metrics;
+use crate::types::UserFilter;
 use crate::Config;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use ipnetwork::IpNetwork;
@@ -19,10 +20,35 @@ pub async fn run(config: Arc<Config>, cache: Cache) -> std::io::Result<()> {
     let cache_data = web::Data::new(cache);
     let metrics_endpoint = config.metrics_endpoint.clone();
 
+    // Build fixed ignore list.
+    let users_to_ignore = config
+        .ignore_users
+        .as_ref()
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(Vec::new);
+
+    // Compile regex ignore list.
+    let users_to_ignore_regex = if let Some(patterns) = &config.ignore_users_regex {
+        match compile_regexes(patterns) {
+            Ok(regexes) => regexes,
+            Err(err_msg) => {
+                warn!("Error compiling regexes: {}", err_msg);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, err_msg));
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Create the persistent UserFilter.
+    let user_filter = UserFilter::new(users_to_ignore, users_to_ignore_regex);
+    let user_filter_data = web::Data::new(user_filter);
+
     HttpServer::new(move || {
         App::new()
             .app_data(config_data.clone())
             .app_data(cache_data.clone())
+            .app_data(user_filter_data.clone())
             // Register the metrics endpoint (e.g. "/metrics")
             .service(web::resource(&metrics_endpoint).route(web::get().to(metrics_handler)))
     })
@@ -36,6 +62,7 @@ async fn metrics_handler(
     req: HttpRequest,
     config: web::Data<Arc<Config>>,
     cache: web::Data<Cache>,
+    user_filter: web::Data<UserFilter>,
 ) -> impl Responder {
     // Log the remote IP
     if let Some(peer_addr) = req.peer_addr() {
@@ -63,13 +90,7 @@ async fn metrics_handler(
         }
     }
 
-    let users_to_ignore = config
-        .ignore_users
-        .as_ref()
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_else(|| Vec::new());
-
-    let sessions = match metrics::scrape_sessions(users_to_ignore) {
+    let sessions = match metrics::scrape_sessions(&user_filter) {
         Ok(s) => s,
         Err(err_msg) => {
             warn!("Error getting metrics: {}", err_msg);
@@ -95,6 +116,18 @@ async fn metrics_handler(
     }
 
     text_plain_ok(metrics_str)
+}
+
+/// Compile a list of regular expressions.
+/// If any of the provided regular expressions are invalid, the function returns an error.
+fn compile_regexes(patterns: &[String]) -> Result<Vec<regex::Regex>, String> {
+    patterns
+        .iter()
+        .map(|pat| {
+            regex::Regex::new(pat)
+                .map_err(|e| format!("Invalid regular expression '{}': {}", pat, e))
+        })
+        .collect()
 }
 
 /// Check if the given IP address is allowed based on the provided list.
@@ -146,4 +179,24 @@ fn text_plain_server_error(body: String) -> HttpResponse {
 
 fn text_plain_ok(body: String) -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
+}
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+    use yare::parameterized;
+
+    #[parameterized(
+        root_ok = { "^root$", true },
+        root_fail = { "root(", false },
+    )]
+    fn test_compile_regexes(input: &str, ok: bool) {
+        let result = compile_regexes(&[input.to_string()]);
+        if ok {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+    }
 }
